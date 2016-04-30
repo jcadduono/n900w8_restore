@@ -1,0 +1,195 @@
+#!/sbin/sh
+# installer backend
+
+tmp=/tmp/n900w8_restore
+bb=$tmp/busybox
+blkdir=$tmp/mmcblk0
+partloc=/dev/block/platform/msm_sdcc.1/by-name
+backupmnt=/external_sd
+backupdir=$backupmnt/mmcblk0_backup
+ddbs=16384
+
+if [ "$3" ]; then
+	zip=$3
+	console=/proc/$$/fd/$2
+	# write the location of the console buffer to /tmp/console for other scripts to use
+	echo "$console" > /tmp/console
+else
+	console=$(cat /tmp/console)
+	[ "$console" ] || console=/proc/$$/fd/1
+fi
+
+print() {
+	if [ "$1" ]; then
+		echo "ui_print $1" > $console
+	else
+		echo "ui_print  " > $console
+	fi
+	echo
+}
+
+abort() {
+	[ "$1" ] && {
+		print "Error: $1"
+		print "Aborting..."
+	}
+	cleanup
+	print "Failed to restore partitions!"
+	exit 1
+}
+
+cleanup() {
+	[ "$zip" ] && rm /tmp/console
+}
+
+extract() {
+	rm -rf "$2"
+	mkdir -p "$2"
+	unzip -o "$1" -d "$2"
+}
+
+wait () {
+	$bb sleep 0.5
+	print
+	return 0
+}
+
+backup_part() {
+	if [ ! -b "$partloc/$1" ]; then
+		print "Can't find partition '$1', skipping..."
+		wait && return 1
+	fi
+	print "Backing up partition '$1'..."
+	if $bb dd bs=$ddbs if="$partloc/$1" of="$backupdir/$1.bin"; then
+		wait && return 0
+	else
+		print "Failed to back up partition '$1'!"
+		wait && return 1
+	fi
+}
+
+wipe_part() {
+	if [ ! -b "$partloc/$1" ]; then
+		print "Can't find partition '$1', skipping..."
+		wait && return 1
+	fi
+	print "Wiping partition '$1'..."
+	$bb dd bs=$ddbs if=/dev/zero of="$partloc/$1"
+	wait && return 0
+}
+
+restore_part() {
+	if [ ! -b "$partloc/$1" ]; then
+		print "Can't find partition '$1', skipping..."
+		wait && return 1
+	fi
+	if [ ! -f "$2" ]; then
+		print "Can't find block file '$2', skipping..."
+		wait && return 1
+	fi
+	print "Restoring '$2' to partition '$1'..."
+	if $bb dd bs=$ddbs if="$2" of="$partloc/$1"; then
+		print "SUCCESS!"
+		wait && return 0
+	else
+		print "FAIL!"
+		wait && return 1
+	fi
+}
+
+print "#######################################"
+print "#    mmcblk0 restore for SM-N900W8    #"
+print "#      by jcadduono, version 1.0      #"
+print "#######################################"
+
+# Unpack the installer
+[ "$zip" ] && {
+	print "Unpacking the installer..."
+	extract "$zip" "$tmp"
+}
+cd "$tmp"
+
+chmod 0755 "$bb"
+[ -x "$bb" ] || abort "Failed to find executable busybox!"
+
+[ -d "$partloc" ] || abort "Can't find partition by-name directory!"
+
+[ -d "$blkdir" ] || abort "Can't find directory of partitions to restore!"
+
+$bb mountpoint -q "$backupmnt" || abort "microSD card not mounted for backup!"
+
+mkdir -p "$backupdir"
+serialno=$(getprop ro.serialno)
+if [ "$serialno" ]; then
+	print "Found serial number: $serialno"
+	backupdir=$backupdir/$serialno
+else
+	print "Failed to find serial number!"
+	backupdir=$backupdir/unknown
+fi
+print "Backups of your partitions will be stored at:"
+print "- $backupdir"
+mkdir "$backupdir" || abort "Failed to create backup directory! Does it already exist?"
+
+$bb ls -1 "$blkdir" | $bb grep ".*\.bin" > "$tmp/blkindex"
+
+wait
+
+blkcount=$($bb wc -l "$tmp/blkindex" | $bb cut -f1 -d' ')
+[ "$blkcount" -gt 0 ] || abort "Found no partitions to restore!"
+print "Found $blkcount partitions to restore"
+
+wait
+
+print "Starting the restoration..."
+
+wait
+
+restore_success=0
+restore_fail=0
+restore_danger=0
+
+while read pbin; do
+	part=${pbin%.bin}
+	if backup_part "$part"; then
+		wipe_part "$part"
+		if restore_part "$part" "$blkdir/$pbin"; then
+			restore_success=$((restore_success+1))
+		else
+			if restore_part "$part" "$backupdir/$pbin"; then
+				restore_fail=$((restore_fail+1))
+			else
+				restore_danger=$((restore_danger+1))
+			fi
+		fi
+	else
+		print "Skipping partition '$part'"
+	fi
+done < "$tmp/blkindex"
+
+print "Restoration complete!"
+
+wait
+
+print "Successfully restored partitions: $restore_success"
+print "Failed to restore partitions: $restore_fail"
+print "Partitions in a dangerous state: $restore_danger"
+
+wait
+
+print "Saving recovery.log to:"
+print " - $backupdir/recovery.log"
+$bb cat "/tmp/recovery.log" > "$backupdir/recovery.log"
+
+wait
+
+print "If you have any issues, replace the files in the zip at mmcblk0 with the ones in your backup folder, which is located at:"
+print "- $backupdir"
+print "You can then move the backup folder somewhere else and simply flash the new zip to restore your backup."
+
+wait
+
+cleanup
+
+[ "$restore_fail" -gt 0 -o "$restore_danger" -gt 0 ] && exit 1
+exit 0
